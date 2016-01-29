@@ -1,0 +1,505 @@
+package EUS
+
+import org.apache.log4j.Logger
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import EUS.utils.KeelParser
+import org.apache.spark.broadcast.Broadcast
+import scala.collection.mutable.ListBuffer
+import org.apache.mahout.keel.Dataset.InstanceSet
+import org.apache.mahout.keel.Algorithms.ImbalancedClassification.Ensembles._
+import java.io.IOException
+import EUS.utils.Utils
+import java.io.File
+import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.mllib.linalg.Vectors
+import java.util.ArrayList
+import com.typesafe.config.ConfigFactory
+import EUS.utils.Utilities
+import EUS.utils.ComputeResults
+import java.io.PrintWriter
+import org.apache.spark.rdd.MapPartitionsRDD
+import org.apache.spark.rdd.RDD
+import scala.util.Random
+
+/**
+ * @author david
+ */
+object runEUS {
+  def main(arg: Array[String]) {
+
+    var logger = Logger.getLogger(this.getClass())
+    if (arg.length < 7) {
+      logger.error("=> wrong parameters number")
+      System.err.println("Parameters \n\t<path-to-header>\n\t<path-to-train>\n\t<path-to-test>\n\t<number-of-partition>\n\t<version [V1,V2]>\n\t<pathOutput>\n\t<ensemble-conf-file>")
+      System.exit(1)
+    }
+
+    //Reading parameters
+    val pathHeader = arg(0)
+    val pathTrain = arg(1)
+    val pathTest = arg(2)
+    val numPartition = arg(3).toInt
+    val version = arg(4)
+    val pathOutput = arg(5)
+    val ensembleConfFile = arg(6)
+
+    //Basic setup
+    val jobName = "EUS-MR" + "-" + numPartition + "-" + version
+
+    //Linea para ejecutar desde SCALA IDE
+    //val conf = new SparkConf().setAppName(jobName).setMaster("local[*]")
+    //Linea para ejecutar desde local / cluster
+    val conf = new SparkConf().setAppName(jobName)
+    val sc = new SparkContext(conf)
+
+    logger.info("=> jobName \"" + jobName + "\"")
+    logger.info("=> pathToHeader \"" + pathHeader + "\"")
+    logger.info("=> pathToTrain \"" + pathTrain + "\"")
+    logger.info("=> pathToTest \"" + pathTest + "\"")
+    logger.info("=> NumberPartition \"" + numPartition + "\"")
+    logger.info("=> Version \"" + version + "\"")
+    logger.info("=> pathToOuput \"" + pathOutput + "\"")
+    logger.info("=> ensembleConfFile \"" + ensembleConfFile + "\"")
+
+    var inparam = new String
+    inparam += "=> jobName \"" + jobName + "\"" + "\n"
+    inparam += "=> pathToHeader \"" + pathHeader + "\"" + "\n"
+    inparam += "=> pathToTrain \"" + pathTrain + "\"" + "\n"
+    inparam += "=> pathToTest \"" + pathTest + "\"" + "\n"
+    inparam += "=> NumberPartition \"" + numPartition + "\"" + "\n"
+    inparam += "=> Version \"" + version + "\"" + "\n"
+    inparam += "=> pathToOuput \"" + pathOutput + "\"" + "\n"
+    inparam += "=> ensembleConfFile \"" + ensembleConfFile + "\"" + "\n"
+
+    logger.info("\nReading training file: " + pathTrain + " in " + numPartition + " partitions");
+    val trainRaw = sc.textFile(pathTrain: String, numPartition).cache
+
+    //  val numSamplesTrain = trainRaw.count()
+
+    // logger.info("=> numSamplesTrain \"" + numSamplesTrain + "\"")
+
+    val converter = KeelParser.getParserFromHeader(sc, pathHeader)
+    //val train = trainRaw.map(line => (KeelParser.parserToDouble(converter, line)))
+    //val test = sc.broadcast(testRaw.map(line => KeelParser.parserToDouble(converter, line)).collect)
+
+    //val numSamplesTest = testRaw.count()
+    //val numClass = KeelParser.getNumClassFromHeader(sc, pathHeader)
+
+    //load the configuration file from the ensembleConfFile parameter
+    val ensembleConf = scala.io.Source.fromFile(ensembleConfFile)
+    var ensembleParam = try ensembleConf.mkString finally ensembleConf.close()
+
+    if (ensembleParam == null) {
+      ensembleParam = "seed = 48127491\n" +
+        "pruned = TRUE\n" +
+        "confidence = 0.25\n" +
+        "instancesPerLeaf = 2\n" +
+        "nClassifiers = 1\n" +
+        "ensembleType = ERUSBOOST\n" +
+        "train method = NORESAMPLING\n" +
+        "RUSBoost N prctg de la maj/ Quantity of balancing in SMOTE = 50\n" +
+        "ISmethod = QstatEUB_M_GM\n" +
+        //"number of Bags for hybrid = 4\n" + 
+        "No. of window minority = 1\n" +
+        "No. of window majority = -1"; // -1 = IR!  Windowing is activated by default.      
+    }
+    logger.info("Using Parameters:\n" + ensembleParam);
+
+    logger.info("\nStarting training................. ");
+    val timeStartModel = System.nanoTime
+    /// MAP
+    var models = new Array[Model_MapReduce](0);
+    if (version.equalsIgnoreCase("V1")) {
+      models = trainRaw.mapPartitions(
+        dataset => createModel(dataset, ensembleParam, pathHeader)).collect //Needs to collect before reduce. Otherwise modelCollector is not updated.
+    } else if (version.equalsIgnoreCase("V2")) {
+
+      // for ECBLD
+      /*    val train_positive = trainRaw.filter(line => line.endsWith(",1"))
+      val train_negative = trainRaw.filter(line => line.endsWith(",0"))
+*/
+      val train_positive = trainRaw.filter(line => line.contains("positive"))
+      val train_negative = trainRaw.filter(line => line.contains("negative"))
+
+      /*    val numPositive = train_positive.count()
+      val numNegative = train_negative.count()
+
+      logger.info("=> numPositive \"" + numPositive + "\"")
+      logger.info("=> numNegative \"" + numNegative + "\"")
+*/
+      val positive_broadcast = sc.broadcast(train_positive.collect())
+
+      models = train_negative.mapPartitions(
+        dataset => createModelV2(dataset, positive_broadcast, ensembleParam, pathHeader)).collect //Needs to collect before reduce. Otherwise modelCollector is not updated.
+
+     // positive_broadcast.destroy // free memory.
+
+    } else {  // V3: double EUS in the maps.
+
+      val train_positive = trainRaw.filter(line => line.contains("positive"))
+      val train_negative = trainRaw.filter(line => line.contains("negative"))
+
+      val positive_broadcast = sc.broadcast(train_positive.collect())
+
+      models = train_negative.mapPartitions(
+        dataset => createModelV3(dataset, positive_broadcast, ensembleParam, pathHeader)).collect 
+    }
+
+    /// REDUCE
+
+    // esto no está bien, no necesitas escribir y guardar el modelo en este caso!!
+    // eso era para Hadoop, pero no aquí.
+
+    val modelCollector = new Model_MapReduce()
+    // models.foreach { model => modelCollector.addModel(model.writeModel()) }
+    models.foreach { model => modelCollector.addModel(model) }
+    logger.info("Total number of clasifiers: " + modelCollector.n_classifiers)
+    val timeEndModel = System.nanoTime
+
+    //CLASSIFICATION
+    logger.info("\nStarting classification................. ");
+
+    logger.info("\nReading test file: " + pathTest);
+
+    val timeStartClassification = System.nanoTime
+
+    // isaac: I have fixed the parititon of the test data as the same of numPartitions parts as was done in CEC15.
+
+    val testRaw = sc.textFile(pathTest: String, numPartition) //Obligo a una particion para asegurar la linealidad de los datos.
+
+    logger.info("\ntest set loaded! ");
+
+    val modelsBroadcast = sc.broadcast(modelCollector)
+    // val classification = testRaw.mapPartitions(dataset => classifier(dataset, converter, modelCollector))
+    val classification = testRaw.mapPartitions(dataset => classifierBroadCast(dataset, converter, modelsBroadcast))
+
+    val timeEndClassification = System.nanoTime
+
+    //logger.info("\nClassifications size:  " + classification.count());
+
+    //OUTPUT
+    var writerResult = new String
+    //classification.collect().foreach ( x => println(x(0) + "-" + x(1)) )
+    writerResult += "##########################################################\n"
+    writerResult += "Confusion Matrix\n"
+    var matrix = Utilities.calculateConfusionMatrix(classification.toArray(), 2)
+    matrix.foreach { x => writerResult += (x(0) + "\t\t\t\t" + x(1)) + "\n" }
+    writerResult += "##########################################################\n"
+    writerResult += "AUC:\t\t" + ComputeResults.computeAuc(matrix.toArray).toString() + "\n"
+    writerResult += "GM:\t\t" + ComputeResults.computeGM(matrix.toArray).toString() + "\n"
+    writerResult += "##########################################################\n"
+    writerResult += "Model Time:\t\t" + (timeEndModel - timeStartModel) / 1e9 + " seconds" + "\n"
+    writerResult += "Classification Time:\t\t" + (timeEndClassification - timeStartClassification) / 1e9 + " seconds" + "\n"
+    writerResult += "##########################################################" + "\n"
+    writerResult += "Input Parameters" + "\n"
+    writerResult += inparam
+    writerResult += "##########################################################" + "\n"
+    writerResult += "Ensemble Parameters" + "\n"
+    writerResult += ensembleParam
+    writerResult += "##########################################################"
+
+    logger.info(writerResult)
+
+    val timestamp: Long = System.currentTimeMillis / 1000
+    //val resultTxt = sc.parallelize(writerResult, 1)
+    //resultTxt.saveAsTextFile(pathOutput + "/Result."+timestamp)
+
+    val pw = new PrintWriter(new File(pathOutput + "/Result." + timestamp + "-" + numPartition + "-" + version))
+    pw.write("\n" + writerResult)
+    pw.close
+
+  }
+
+
+// v3: double EUS.
+
+  def createModelV3[T](iter: Iterator[String], pos: Broadcast[Array[String]], param: String, pathHeader: String): Iterator[Model_MapReduce] = {
+
+    var logger = Logger.getLogger(this.getClass())
+    var parameters = new parseParameters()
+    parameters.parseConfigurationString(param);
+
+    logger.info("\nReading the header file: " + pathHeader);
+    Utils.readHeaderFromFile(pathHeader);
+
+    var auxSet = new ArrayList[String]
+    var auxSet2 = new ArrayList[String]
+    
+
+    //Parser 
+    while (iter.hasNext) {
+      val cur = iter.next
+      auxSet.add(cur.toString())
+      auxSet2.add(cur.toString())
+    }
+    val num_negative = auxSet.size()
+
+
+
+    if (pos.value.length < num_negative) { // this case we add them all... case of Kddcup for example.
+
+      logger.info("\nJoining positive and negative classes" + pos.value.length);
+
+      val iter_pos = pos.value.iterator
+      while (iter_pos.hasNext) {
+        val cur = iter_pos.next
+        auxSet.add(cur.toString())
+      }
+    } else {
+
+      // we take a random subset of the posive set of the size of the negative set.
+
+      logger.info("\nTaking two subsets of the positive set" + pos.value.length);
+
+      val iter_pos = pos.value.iterator
+
+      val range = 0 to (pos.value.length - 1) toList // Generate a list of values between 0 and num_positive
+
+
+      val toAddList = util.Random.shuffle(range).toArray.take((num_negative).toInt) // Shuffle that list of values, and take num_negative elements. //*0.02  *0.25
+
+      val toAddList2 = util.Random.shuffle(range).toArray.take((num_negative).toInt) 
+
+
+      val orderedToAdd = scala.util.Sorting.quickSort(toAddList) // ascending order
+
+      scala.util.Sorting.quickSort(toAddList2) // ascending order
+
+      var added = 0;
+      var added_set2 = 0;
+      var counter = 0;
+
+      while (iter_pos.hasNext && ((added+added_set2) < (num_negative*2).toInt)) { //  *0.25
+
+        val cur = iter_pos.next
+
+	if(added<toAddList.size){
+		if (toAddList(added) == counter) {
+		  auxSet.add(cur.toString())
+		  added = added + 1;
+		}
+
+	}
+
+	if(added_set2<toAddList2.size){
+		if (toAddList2(added_set2) == counter) {
+		  auxSet2.add(cur.toString())
+		  added_set2 = added_set2 + 1;
+		}
+
+	}
+
+        counter = counter + 1;
+      }
+
+    }
+
+
+    logger.info("DATA: Num Positive Instances ------------------ " + pos.value.length)
+   logger.info("DATA: Num Negative Instances ------------------ " + num_negative)
+ 
+    var IS = new InstanceSet()
+
+    IS.readSet(auxSet, true)
+
+    logger.info("Running first EUS: " + IS.getNumInstances)
+
+    var outC45 = new multi_C45(IS, parameters)
+    outC45.execute()
+
+
+    var IS_2 = new InstanceSet()
+    IS_2.readSet(auxSet2, true)
+
+    logger.info("Running second EUS: " + IS_2.getNumInstances)
+
+    var outC45_2 = new multi_C45(IS_2, parameters)
+    outC45_2.execute()
+
+
+    var models = new Array[Model_MapReduce](2)
+    models(0) = outC45.model
+    models(1) = outC45.model
+
+    models.iterator
+  }
+
+
+
+  def createModelV2[T](iter: Iterator[String], pos: Broadcast[Array[String]], param: String, pathHeader: String): Iterator[Model_MapReduce] = {
+
+    var logger = Logger.getLogger(this.getClass())
+    var parameters = new parseParameters()
+    parameters.parseConfigurationString(param);
+
+    logger.info("\nReading the header file: " + pathHeader);
+    Utils.readHeaderFromFile(pathHeader);
+
+
+    var auxSet = new ArrayList[String]
+    var IS = new InstanceSet()
+
+    //Parser 
+    while (iter.hasNext) {
+      val cur = iter.next
+      auxSet.add(cur.toString())
+    }
+    val num_negative = auxSet.size()
+
+    // Isaac, 15/1/2016: esto puede ser la solucion para los problemas de memoria.. no se crea el conjutno conmpleto, pero aleatorio en CADA tarea.
+
+    if (pos.value.length < num_negative) { // this case we add them all... case of Kddcup for example.
+
+      logger.info("\nJoining positive and negative classes" + pos.value.length);
+
+      val iter_pos = pos.value.iterator
+      while (iter_pos.hasNext) {
+        val cur = iter_pos.next
+        auxSet.add(cur.toString())
+      }
+    } else {
+
+      // we take a random subset of the posive set of the size of the negative set.
+
+      logger.info("\nTaking a subset of the positive set" + pos.value.length);
+
+      val iter_pos = pos.value.iterator
+
+      val range = 0 to (pos.value.length - 1) toList // Generate a list of values between 0 and num_positive
+
+      val toAddList = util.Random.shuffle(range).toArray.take((num_negative).toInt) // Shuffle that list of values, and take num_negative elements. //*0.02  *0.25
+
+      print("\n\nELEMENTOS PARA COMPROBAR EL RANDOM: " + toAddList(0) + " - " + toAddList(1) + " - " + toAddList(2))
+
+      val orderedToAdd = scala.util.Sorting.quickSort(toAddList) // ascending order
+
+      var added = 0;
+      var counter = 0;
+
+      while (iter_pos.hasNext && added < (num_negative).toInt) { //  *0.25
+
+        val cur = iter_pos.next
+
+        if (toAddList(added) == counter) {
+          auxSet.add(cur.toString())
+          added = added + 1;
+        }
+
+        counter = counter + 1;
+      }
+
+      /*
+  val iter_pos = Random.shuffle(pos.value.toList).take(num_negative).iterator 
+
+  while(iter_pos.hasNext){                                                       
+     val cur = iter_pos.next
+     auxSet.add(cur.toString())
+  }
+*/
+    }
+
+    //logger.info(auxSet.toString()+"\n")
+    IS.readSet(auxSet, true)
+
+    logger.info("DATA: Num Instances ---------------------------" + IS.getNumInstances)
+    logger.info("DATA: Num Positive Instances ------------------ " + pos.value.length)
+    logger.info("DATA: Num Negative Instances ------------------ " + num_negative)
+
+    var outC45 = new multi_C45(IS, parameters)
+    outC45.execute()
+
+    var models = new Array[Model_MapReduce](1)
+    models(0) = outC45.model
+    models.iterator
+  }
+
+  def createModel[T](iter: Iterator[String], param: String, pathHeader: String): Iterator[Model_MapReduce] = {
+
+    var logger = Logger.getLogger(this.getClass())
+    var parameters = new parseParameters()
+    parameters.parseConfigurationString(param);
+
+    logger.info("\nReading the header file: " + pathHeader);
+    Utils.readHeaderFromFile(pathHeader);
+
+    var auxSet = new ArrayList[String]
+    var IS = new InstanceSet()
+
+    //Parser 
+    while (iter.hasNext) {
+      val cur = iter.next
+      auxSet.add(cur.toString())
+    }
+    //logger.info(auxSet.toString()+"\n")
+    IS.readSet(auxSet, true)
+
+    logger.info("DATA: Num Instances ---------------------------" + IS.getNumInstances)
+
+    var outC45 = new multi_C45(IS, parameters)
+    outC45.execute()
+
+    var models = new Array[Model_MapReduce](1)
+    models(0) = outC45.model
+    models.iterator
+  }
+
+  def classifier[T](iter: Iterator[String], converter: Array[Map[String, Double]], modelCollector: Model_MapReduce): Iterator[Array[Int]] = {
+
+    print("********UsingClassifier******")
+    var logger = Logger.getLogger(this.getClass())
+    var proto = new Array[Double](1)
+    var classes = Array[String]("positive", "negative")
+    //var classes = Array[String]("1","0")
+    var outC45 = new multi_C45(modelCollector);
+    var result = new ListBuffer[Array[Int]]()
+    var instance_result = new Array[Int](2)
+
+    //Parser 
+    while (iter.hasNext) {
+      val cur = iter.next
+      //proto = cur.split(",").dropRight(1).map(x => x.toDouble)
+      proto = KeelParser.parserCategoricalToDouble(converter, cur)
+      var predAndVoteValue = outC45.classificationOutput(proto, classes)
+      //result.+=(predAndVoteValue.getPrediction())
+      instance_result(0) = if (cur.split(",").last.trim().equals(classes(0))) 1 else 0
+      instance_result(1) = if (predAndVoteValue.getPrediction().trim().equals(classes(0))) 1 else 0
+      result += instance_result.clone()
+    }
+
+    result.iterator
+  }
+
+  def classifierBroadCast[T](iter: Iterator[String], converter: Array[Map[String, Double]], modelCollector: Broadcast[Model_MapReduce]): Iterator[Array[Int]] = {
+
+    print("********UsingClassifier******")
+    var logger = Logger.getLogger(this.getClass())
+
+    logger.info("Classifying with broadcast")
+
+    var proto = new Array[Double](1)
+    var classes = Array[String]("positive", "negative")
+    //var classes = Array[String]("1","0")
+    var outC45 = new multi_C45(modelCollector.value);
+    var result = new ListBuffer[Array[Int]]()
+    var instance_result = new Array[Int](2)
+
+    //Parser 
+    while (iter.hasNext) {
+      val cur = iter.next
+      //proto = cur.split(",").dropRight(1).map(x => x.toDouble)
+      proto = KeelParser.parserCategoricalToDouble(converter, cur)
+      var predAndVoteValue = outC45.classificationOutput(proto, classes)
+      //result.+=(predAndVoteValue.getPrediction())
+      instance_result(0) = if (cur.split(",").last.trim().equals(classes(0))) 1 else 0
+      instance_result(1) = if (predAndVoteValue.getPrediction().trim().equals(classes(0))) 1 else 0
+      result += instance_result.clone()
+    }
+
+    result.iterator
+  }
+
+}
+
+  
